@@ -112,9 +112,9 @@ async function processNextTask(): Promise<void> {
 }
 
 export default asyncWorkloadFn(async (event: AsyncWorkloadEvent) => {
-  console.log("Async workload received event:", event.eventId);
+  console.log("Async workload received event:", event.eventName);
 
-  if (event.eventId === "process-task") {
+  if (event.eventName === "process-task") {
     await processNextTask();
   }
 });
