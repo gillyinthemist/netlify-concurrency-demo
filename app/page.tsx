@@ -21,6 +21,13 @@ interface QueueStatus {
     completedCount: number;
     totalTasks: number;
   };
+  rateLimit?: {
+    limit: number;
+    windowSeconds: number;
+    used: number;
+    remaining: number;
+    resetAt: number | null;
+  };
 }
 
 export default function Home() {
@@ -52,50 +59,68 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [autoRefresh]);
 
-  const queueTask = async () => {
-    setQueueing(true);
-    try {
-      const response = await fetch('/api/queue-task', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: { timestamp: Date.now() } }),
-      });
-      const result = await response.json();
-      if (result.success) {
-        await fetchStatus();
-      }
-    } catch (error) {
-      console.error('Error queueing task:', error);
-    } finally {
-      setQueueing(false);
-    }
-  };
-
   const queueMultiple = async (count: number) => {
     setQueueing(true);
     try {
-      // Stagger requests slightly to avoid race conditions
-      const promises = Array.from({ length: count }, (_, index) =>
-        new Promise((resolve) => {
-          setTimeout(async () => {
-            try {
-              const response = await fetch('/api/queue-task', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ data: { timestamp: Date.now() } }),
-              });
-              resolve(response);
-            } catch (error) {
-              console.error(`Error queueing task ${index + 1}:`, error);
-              resolve(null);
+      // Queue tasks in batches to avoid overwhelming browser/server
+      // Unlimited queuing is allowed - rate limiting happens when tasks START processing
+      const BATCH_SIZE = 50; // Process 50 at a time
+      let queued = 0;
+      let failed = 0;
+      
+      for (let batchStart = 0; batchStart < count; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, count);
+        const batchPromises = Array.from({ length: batchEnd - batchStart }, async (_, batchIndex) => {
+          const index = batchStart + batchIndex;
+          try {
+            const response = await fetch('/api/queue-task', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ data: { timestamp: Date.now(), index } }),
+            });
+            
+            if (response.ok) {
+              return { success: true, index };
+            } else {
+              const result = await response.json().catch(() => ({}));
+              console.error(`Failed to queue task ${index + 1}:`, result.error || response.statusText);
+              return { success: false, index, error: result.error || response.statusText };
             }
-          }, index * 50); // 50ms delay between each request
-        })
-      );
-      await Promise.all(promises);
+          } catch (error) {
+            console.error(`Error queueing task ${index + 1}:`, error);
+            return { success: false, index, error: error instanceof Error ? error.message : 'Unknown error' };
+          }
+        });
+        
+        // Wait for batch to complete
+        const batchResults = await Promise.all(batchPromises);
+        
+        // Count successes and failures
+        batchResults.forEach(result => {
+          if (result.success) {
+            queued++;
+          } else {
+            failed++;
+          }
+        });
+        
+        // Small delay between batches to avoid overwhelming
+        if (batchEnd < count) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      
+      // Update status
       await fetchStatus();
+      
+      if (failed > 0) {
+        alert(`Queued ${queued} out of ${count} tasks. ${failed} failed. Check console for details.`);
+      } else {
+        alert(`Successfully queued all ${queued} tasks! They will start processing as rate limit allows (250/min).`);
+      }
     } catch (error) {
       console.error('Error queueing tasks:', error);
+      alert(`Error queueing tasks: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       setQueueing(false);
     }
@@ -128,7 +153,10 @@ export default function Home() {
             Netlify Async Workloads Queue Demo
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            FIFO queue with max concurrency of 6. Each task takes ~30 seconds to complete.
+            FIFO queue with <strong>rate limiting</strong> (250 requests/min) - OpenAI-style. Tasks can take any duration; rate limit controls when they START, not how many run simultaneously.
+          </p>
+          <p className="text-sm text-zinc-500 dark:text-zinc-500 mt-2">
+            Rate limit: Max 250 tasks can <strong>START processing</strong> per minute. Unlimited tasks can be queued. If 300 requests come in, first 250 start immediately, next 50 wait until the minute window resets.
           </p>
         </div>
 
@@ -136,32 +164,11 @@ export default function Home() {
         <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6 mb-6">
           <div className="flex flex-wrap gap-4 items-center">
             <button
-              onClick={queueTask}
+              onClick={() => queueMultiple(300)}
               disabled={queueing}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-semibold"
             >
-              {queueing ? 'Queueing...' : 'Queue 1 Task'}
-            </button>
-            <button
-              onClick={() => queueMultiple(5)}
-              disabled={queueing}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              Queue 5 Tasks
-            </button>
-            <button
-              onClick={() => queueMultiple(20)}
-              disabled={queueing}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              Queue 20 Tasks
-            </button>
-            <button
-              onClick={() => queueMultiple(50)}
-              disabled={queueing}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              Queue 50 Tasks
+              {queueing ? 'Queueing...' : 'Queue 300 Tasks'}
             </button>
             <button
               onClick={clearQueue}
@@ -189,14 +196,17 @@ export default function Home() {
 
         {/* Stats */}
         {status && (
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
             <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6">
               <div className="text-sm text-zinc-600 dark:text-zinc-400 mb-1">Queued</div>
               <div className="text-3xl font-bold text-yellow-600">{status.stats.queuedCount}</div>
             </div>
             <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6">
               <div className="text-sm text-zinc-600 dark:text-zinc-400 mb-1">Processing</div>
-              <div className="text-3xl font-bold text-blue-600">{status.stats.processingCount} / 6</div>
+              <div className="text-3xl font-bold text-blue-600">{status.stats.processingCount}</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-500 mt-1">
+                Currently running
+              </div>
             </div>
             <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6">
               <div className="text-sm text-zinc-600 dark:text-zinc-400 mb-1">Completed</div>
@@ -206,6 +216,22 @@ export default function Home() {
               <div className="text-sm text-zinc-600 dark:text-zinc-400 mb-1">Total Tasks</div>
               <div className="text-3xl font-bold text-zinc-900 dark:text-zinc-50">{status.stats.totalTasks}</div>
             </div>
+            {status.rateLimit && (
+              <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6">
+                <div className="text-sm text-zinc-600 dark:text-zinc-400 mb-1">Rate Limit (per min)</div>
+                <div className="text-3xl font-bold text-purple-600">
+                  {status.rateLimit.used} / {status.rateLimit.limit}
+                </div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-500 mt-1">
+                  {status.rateLimit.remaining} remaining
+                </div>
+                {status.rateLimit.resetAt && status.rateLimit.used >= status.rateLimit.limit && (
+                  <div className="text-xs text-orange-500 dark:text-orange-400 mt-1">
+                    Resets in {Math.max(0, Math.ceil((status.rateLimit.resetAt - Date.now()) / 1000))}s
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -241,7 +267,7 @@ export default function Home() {
             {/* Processing Tasks */}
             <div className="bg-white dark:bg-zinc-800 rounded-lg shadow-lg p-6">
               <h2 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50 mb-4">
-                Processing ({status.processing.length} / 6)
+                Processing ({status.processing.length})
               </h2>
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {status.processing.length === 0 ? (

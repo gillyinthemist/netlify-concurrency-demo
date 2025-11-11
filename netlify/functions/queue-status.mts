@@ -15,6 +15,7 @@ interface QueueState {
   processing: string[];
   completed: string[];
   tasks: Record<string, Task>;
+  rateLimitHistory: number[];
 }
 
 async function getQueueState(): Promise<QueueState> {
@@ -27,7 +28,13 @@ async function getQueueState(): Promise<QueueState> {
       processing: [],
       completed: [],
       tasks: {},
+      rateLimitHistory: [],
     };
+  }
+
+  // Ensure rateLimitHistory exists (for backwards compatibility)
+  if (!data.rateLimitHistory) {
+    data.rateLimitHistory = [];
   }
 
   return data as QueueState;
@@ -51,6 +58,13 @@ export default async (req: Request) => {
       .map((id) => state.tasks[id])
       .filter(Boolean); // Last 50 completed
 
+    // Calculate rate limit info (based on when tasks STARTED processing)
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000;
+    const recentStarts = state.rateLimitHistory.filter(
+      (timestamp) => timestamp > oneMinuteAgo
+    ).length;
+
     return new Response(
       JSON.stringify({
         queued,
@@ -61,6 +75,15 @@ export default async (req: Request) => {
           processingCount: processing.length,
           completedCount: completed.length,
           totalTasks: Object.keys(state.tasks).length,
+        },
+        rateLimit: {
+          limit: 250,
+          windowSeconds: 60,
+          used: recentStarts,
+          remaining: Math.max(0, 250 - recentStarts),
+          resetAt: state.rateLimitHistory.length > 0 && recentStarts > 0
+            ? Math.min(...state.rateLimitHistory.filter((t) => t > oneMinuteAgo)) + 60000
+            : null,
         },
       }),
       {

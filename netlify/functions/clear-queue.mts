@@ -15,6 +15,7 @@ export default async (req: Request) => {
         processing: [],
         completed: [],
         tasks: {},
+        rateLimitHistory: [],
       })
     );
 

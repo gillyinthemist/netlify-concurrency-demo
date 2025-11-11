@@ -15,7 +15,11 @@ interface QueueState {
   processing: string[];
   completed: string[];
   tasks: Record<string, Task>;
+  rateLimitHistory: number[]; // Timestamps of completed tasks (for rate limiting)
 }
+
+// Note: Rate limiting is handled in process-task.mts when tasks START processing
+// This file just queues tasks - unlimited queuing is allowed
 
 async function getQueueState(): Promise<QueueState> {
   const store = getStore("queue-state");
@@ -27,7 +31,13 @@ async function getQueueState(): Promise<QueueState> {
       processing: [],
       completed: [],
       tasks: {},
+      rateLimitHistory: [],
     };
+  }
+
+  // Ensure rateLimitHistory exists (for backwards compatibility)
+  if (!data.rateLimitHistory) {
+    data.rateLimitHistory = [];
   }
 
   return data as QueueState;
@@ -57,16 +67,21 @@ export default async (req: Request) => {
       data: body.data || {},
     };
 
-    // Retry logic to handle race conditions
+    // Note: We don't check rate limit when queueing - unlimited tasks can be queued
+    // Rate limiting happens when tasks START processing (in process-task.mts)
+    // This allows unlimited queuing, but only 250 tasks START per minute
+    
+    // Now add task to queue with retry logic
+    let state = await getQueueState();
     let retries = 5;
-    let state: QueueState | undefined;
     let success = false;
 
     while (retries > 0 && !success) {
-      state = await getQueueState();
+      // Re-fetch state in case it changed
+      const currentState = await getQueueState();
       
       // Check if task ID already exists (shouldn't happen, but safety check)
-      if (state.tasks[taskId]) {
+      if (currentState.tasks[taskId]) {
         // Generate new ID if collision (extremely unlikely)
         taskId = `task-${Date.now()}-${performance.now().toString(36)}-${Math.random()
           .toString(36)
@@ -75,12 +90,15 @@ export default async (req: Request) => {
         continue;
       }
 
-      // Add task to queue
-      state.queue.push(taskId);
-      state.tasks[taskId] = task;
+      // Add task to queue and update rate limit history
+      currentState.queue.push(taskId);
+      currentState.tasks[taskId] = task;
+      // Update rate limit history (merge with what we calculated above)
+      currentState.rateLimitHistory = state.rateLimitHistory;
       
       try {
-        await saveQueueState(state);
+        await saveQueueState(currentState);
+        state = currentState;
         success = true;
       } catch (error) {
         // If save fails, retry after small delay
@@ -95,20 +113,17 @@ export default async (req: Request) => {
       throw new Error("Failed to queue task after retries");
     }
 
-    // Trigger processing if under concurrency limit
-    const MAX_CONCURRENCY = 6;
-    if (state.processing.length < MAX_CONCURRENCY) {
-      try {
-        const { AsyncWorkloadsClient } = await import(
-          "@netlify/async-workloads"
-        );
-        const client = new AsyncWorkloadsClient();
-        await client.send("process-task");
-      } catch (error) {
-        console.error("Failed to trigger async workload:", error);
-        // In production, this would fail, but for local dev we'll continue
-        // The task is still queued and will be processed when the extension is available
-      }
+    // Trigger processing - rate limit check happens in process-task function
+    // We can queue unlimited tasks, but only 250 will START per minute
+    try {
+      const { AsyncWorkloadsClient } = await import(
+        "@netlify/async-workloads"
+      );
+      const client = new AsyncWorkloadsClient();
+      await client.send("process-task");
+    } catch (error) {
+      console.error("Failed to trigger async workload:", error);
+      // The task is still queued and will be processed when available
     }
 
     return new Response(

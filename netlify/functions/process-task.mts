@@ -4,8 +4,8 @@ import type {
 } from "@netlify/async-workloads";
 import { getStore } from "@netlify/blobs";
 
-const MAX_CONCURRENCY = 6;
-const TASK_DURATION = 30000; // 30 seconds
+const TASK_DURATION = 30000; // 30 seconds (can be longer - that's fine!)
+const RATE_LIMIT_REQUESTS = 250; // Max tasks that can START per minute
 
 interface Task {
   id: string;
@@ -21,6 +21,7 @@ interface QueueState {
   processing: string[]; // Currently processing task IDs
   completed: string[]; // Completed task IDs
   tasks: Record<string, Task>;
+  rateLimitHistory: number[]; // Timestamps of completed tasks (for rate limiting)
 }
 
 async function getQueueState(): Promise<QueueState> {
@@ -33,7 +34,13 @@ async function getQueueState(): Promise<QueueState> {
       processing: [],
       completed: [],
       tasks: {},
+      rateLimitHistory: [],
     };
+  }
+
+  // Ensure rateLimitHistory exists (for backwards compatibility)
+  if (!data.rateLimitHistory) {
+    data.rateLimitHistory = [];
   }
 
   return data as QueueState;
@@ -47,15 +54,24 @@ async function saveQueueState(state: QueueState): Promise<void> {
 async function processNextTask(): Promise<void> {
   const state = await getQueueState();
 
-  // Check if we can process more tasks (concurrency limit)
-  if (state.processing.length >= MAX_CONCURRENCY) {
-    console.log(`Max concurrency reached (${MAX_CONCURRENCY}). Waiting...`);
-    return;
-  }
-
   // Get next task from queue
   if (state.queue.length === 0) {
     console.log("No tasks in queue");
+    return;
+  }
+
+  // Check rate limit - how many tasks have STARTED in the last minute
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+  const recentStarts = state.rateLimitHistory.filter(
+    (timestamp) => timestamp > oneMinuteAgo
+  ).length;
+
+  if (recentStarts >= RATE_LIMIT_REQUESTS) {
+    console.log(
+      `Rate limit reached (${RATE_LIMIT_REQUESTS} starts/min). Waiting for window to reset...`
+    );
+    // Don't process yet - wait for rate limit window to reset
     return;
   }
 
@@ -72,10 +88,21 @@ async function processNextTask(): Promise<void> {
   task.startedAt = Date.now();
   state.processing.push(taskId);
 
+  // Record this start time for rate limiting (when task STARTS, not when it finishes)
+  state.rateLimitHistory.push(Date.now());
+
+  // Clean up old timestamps (keep only last hour for efficiency)
+  const oneHourAgo = Date.now() - 3600000;
+  state.rateLimitHistory = state.rateLimitHistory.filter(
+    (timestamp) => timestamp > oneHourAgo
+  );
+
   await saveQueueState(state);
 
   console.log(
-    `Processing task ${taskId} (${state.processing.length}/${MAX_CONCURRENCY} concurrent)`
+    `Processing task ${taskId} (${
+      recentStarts + 1
+    }/${RATE_LIMIT_REQUESTS} started this minute)`
   );
 
   // Simulate 30-second task
@@ -92,21 +119,30 @@ async function processNextTask(): Promise<void> {
     updatedState.tasks[taskId].status = "completed";
     updatedState.tasks[taskId].completedAt = Date.now();
     updatedState.completed.push(taskId);
+
+    // Note: Rate limit history is tracked when tasks are queued (in queue-task.mts),
+    // not when they complete. This matches OpenAI's rate limiting model.
   }
 
   await saveQueueState(updatedState);
   console.log(`Completed task ${taskId}`);
 
-  // Process next task if available
+  // Process next task if available (check rate limit, not concurrency)
   const finalState = await getQueueState();
-  if (
-    finalState.queue.length > 0 &&
-    finalState.processing.length < MAX_CONCURRENCY
-  ) {
-    // Trigger next task processing
-    const { AsyncWorkloadsClient } = await import("@netlify/async-workloads");
-    const client = new AsyncWorkloadsClient();
-    await client.send("process-task");
+  if (finalState.queue.length > 0) {
+    // Check if we can start another task (rate limit check)
+    const finalNow = Date.now();
+    const finalOneMinuteAgo = finalNow - 60000;
+    const finalRecentStarts = finalState.rateLimitHistory.filter(
+      (timestamp) => timestamp > finalOneMinuteAgo
+    ).length;
+
+    if (finalRecentStarts < RATE_LIMIT_REQUESTS) {
+      // Trigger next task processing
+      const { AsyncWorkloadsClient } = await import("@netlify/async-workloads");
+      const client = new AsyncWorkloadsClient();
+      await client.send("process-task");
+    }
   }
 }
 
