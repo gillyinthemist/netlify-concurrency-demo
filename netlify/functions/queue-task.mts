@@ -102,15 +102,43 @@ export default async (req: Request) => {
         success = true;
       } catch (error) {
         // If save fails, retry after small delay
+        console.error(`Failed to save queue state (attempt ${6 - retries}/5):`, error);
         retries--;
         if (retries > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 10 + Math.random() * 20));
+          const delay = 50 + Math.random() * 100; // Longer delay for blob rate limits
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        } else {
+          // Log final failure with details
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          console.error(`Failed to queue task after all retries:`, errorMessage);
+          // Don't throw - return error response instead
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: "Failed to queue task - Netlify Blobs rate limit may be reached",
+              details: errorMessage,
+            }),
+            {
+              status: 503, // Service Unavailable
+              headers: { "Content-Type": "application/json" },
+            }
+          );
         }
       }
     }
 
     if (!success || !state) {
-      throw new Error("Failed to queue task after retries");
+      // This shouldn't happen due to the return above, but just in case
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Failed to queue task - Netlify Blobs may be rate-limited",
+        }),
+        {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     }
 
     // Trigger processing - rate limit check happens in process-task function
