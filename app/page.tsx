@@ -74,11 +74,22 @@ export default function Home() {
   const queueMultiple = async (count: number) => {
     setQueueing(true);
     try {
-      const promises = Array.from({ length: count }, () =>
-        fetch('/api/queue-task', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ data: { timestamp: Date.now() } }),
+      // Stagger requests slightly to avoid race conditions
+      const promises = Array.from({ length: count }, (_, index) =>
+        new Promise((resolve) => {
+          setTimeout(async () => {
+            try {
+              const response = await fetch('/api/queue-task', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data: { timestamp: Date.now() } }),
+              });
+              resolve(response);
+            } catch (error) {
+              console.error(`Error queueing task ${index + 1}:`, error);
+              resolve(null);
+            }
+          }, index * 50); // 50ms delay between each request
         })
       );
       await Promise.all(promises);

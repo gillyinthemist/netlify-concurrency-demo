@@ -1,7 +1,6 @@
-import {
-  asyncWorkloadFn,
-  type AsyncWorkloadEvent,
-  type AsyncWorkloadConfig,
+import type {
+  AsyncWorkloadEvent,
+  AsyncWorkloadConfig,
 } from "@netlify/async-workloads";
 import { getStore } from "@netlify/blobs";
 
@@ -111,13 +110,18 @@ async function processNextTask(): Promise<void> {
   }
 }
 
-export default asyncWorkloadFn(async (event: AsyncWorkloadEvent) => {
+// Handler function
+async function handler(event: AsyncWorkloadEvent) {
   console.log("Async workload received event:", event.eventName);
 
   if (event.eventName === "process-task") {
     await processNextTask();
   }
-});
+}
+
+// Dynamically import asyncWorkloadFn using top-level await (supported in ES modules)
+const { asyncWorkloadFn } = await import("@netlify/async-workloads");
+export default asyncWorkloadFn(handler);
 
 export const asyncWorkloadConfig: AsyncWorkloadConfig = {
   events: ["process-task"],

@@ -45,9 +45,10 @@ export default async (req: Request) => {
 
   try {
     const body = await req.json().catch(() => ({}));
-    const taskId = `task-${Date.now()}-${Math.random()
+    // Use high-resolution time and more randomness to ensure unique IDs
+    let taskId = `task-${Date.now()}-${performance.now().toString(36)}-${Math.random()
       .toString(36)
-      .substring(2, 9)}`;
+      .substring(2, 9)}-${Math.random().toString(36).substring(2, 9)}`;
 
     const task: Task = {
       id: taskId,
@@ -56,10 +57,43 @@ export default async (req: Request) => {
       data: body.data || {},
     };
 
-    const state = await getQueueState();
-    state.queue.push(taskId);
-    state.tasks[taskId] = task;
-    await saveQueueState(state);
+    // Retry logic to handle race conditions
+    let retries = 5;
+    let state: QueueState | undefined;
+    let success = false;
+
+    while (retries > 0 && !success) {
+      state = await getQueueState();
+      
+      // Check if task ID already exists (shouldn't happen, but safety check)
+      if (state.tasks[taskId]) {
+        // Generate new ID if collision (extremely unlikely)
+        taskId = `task-${Date.now()}-${performance.now().toString(36)}-${Math.random()
+          .toString(36)
+          .substring(2, 9)}-${Math.random().toString(36).substring(2, 9)}`;
+        task.id = taskId;
+        continue;
+      }
+
+      // Add task to queue
+      state.queue.push(taskId);
+      state.tasks[taskId] = task;
+      
+      try {
+        await saveQueueState(state);
+        success = true;
+      } catch (error) {
+        // If save fails, retry after small delay
+        retries--;
+        if (retries > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 10 + Math.random() * 20));
+        }
+      }
+    }
+
+    if (!success || !state) {
+      throw new Error("Failed to queue task after retries");
+    }
 
     // Trigger processing if under concurrency limit
     const MAX_CONCURRENCY = 6;
